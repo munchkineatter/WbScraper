@@ -22,6 +22,17 @@ class WebScraper {
             (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
         ];
         this.currentProxyIndex = 0;
+
+        // Add configuration for concurrency
+        this.maxConcurrentRequests = 10; // Adjust based on target site's limits
+        this.batchSize = 50; // Size of batches for concurrent processing
+
+        // Add supported file extensions for binary downloads
+        this.binaryExtensions = new Set([
+            '.pdf', '.doc', '.docx', '.xls', '.xlsx',
+            '.ppt', '.pptx', '.zip', '.rar', '.mp3',
+            '.mp4', '.jpg', '.jpeg', '.png', '.gif'
+        ]);
     }
 
     initializeEventListeners() {
@@ -64,13 +75,13 @@ class WebScraper {
                 return;
             }
 
-            this.log(`Starting initial URL scan of: ${url}`, 'info');
+            this.log(`Starting URL discovery scan of: ${url}`, 'info');
             this.progressSection.style.display = 'block';
-            this.updateProgress(0, 'Starting scan...');
+            this.updateProgress(0, 'Starting URL discovery...');
 
             const parsedUrl = new URL(url);
             const baseUrl = parsedUrl.origin;
-            const basePath = parsedUrl.pathname.replace(/\/+$/, ''); // Remove trailing slashes
+            const basePath = parsedUrl.pathname.replace(/\/+$/, '');
             const allLinks = new Set();
             
             await this.collectUrls(url, allLinks, baseUrl, basePath);
@@ -81,14 +92,13 @@ class WebScraper {
             
             this.displayLinks(Array.from(allLinks));
             
-            this.updateProgress(100, 'Initial scan complete!');
-            this.log('Please select the pages you want to download', 'info');
+            this.updateProgress(100, 'URL discovery complete!');
+            this.log('Select the pages you want to download', 'info');
             
             setTimeout(() => {
                 this.progressSection.style.display = 'none';
             }, 1000);
 
-            this.downloadBtn.textContent = 'Scan & Download Selected';
             this.downloadBtn.disabled = false;
             this.selectAllBtn.style.display = 'block';
         } catch (error) {
@@ -147,55 +157,93 @@ class WebScraper {
         throw new Error(`Failed to fetch after ${retries} attempts: ${lastError.message}`);
     }
 
-    // Update the collectUrls method
+    // Update the collectUrls method to properly handle nested link discovery
     async collectUrls(url, allLinks, baseUrl, basePath, depth = 0, maxDepth = 3) {
-        if (depth > maxDepth || allLinks.has(url)) {
+        if (depth > maxDepth) {
             return;
         }
 
         try {
-            // Check if URL is within the target directory
             const currentPath = new URL(url).pathname;
             if (!this.isWithinBasePath(currentPath, basePath)) {
                 this.log(`Skipping ${url} - Outside target directory`, 'warning');
                 return;
             }
 
-            this.log(`Finding links in: ${url}`, 'info');
-            const html = await this.fetchWithCORS(url);
+            this.log(`Discovering links in: ${url}`, 'info');
             
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, 'text/html');
-            
-            // Add the current URL to the set
-            allLinks.add(url);
-            
-            const links = Array.from(doc.getElementsByTagName('a'))
-                .map(a => {
+            // Process URLs in batches
+            const pendingUrls = new Set([url]);
+            const processedUrls = new Set();
+
+            while (pendingUrls.size > 0) {
+                // Take a batch of URLs to process
+                const batch = Array.from(pendingUrls).slice(0, this.batchSize);
+                batch.forEach(url => pendingUrls.delete(url));
+                const newBatch = batch.filter(url => !processedUrls.has(url));
+                
+                if (newBatch.length === 0) continue;
+
+                // Process batch concurrently
+                const promises = newBatch.map(async (batchUrl) => {
                     try {
-                        const href = new URL(a.href, url).href;
-                        // Only include links from the same domain and within the base path
-                        if (href.startsWith(baseUrl)) {
-                            const hrefPath = new URL(href).pathname;
-                            if (this.isWithinBasePath(hrefPath, basePath)) {
-                                return href;
-                            }
+                        if (processedUrls.has(batchUrl)) return;
+                        
+                        // Check if it's a binary file
+                        const isBinary = this.isBinaryFile(batchUrl);
+                        if (isBinary) {
+                            processedUrls.add(batchUrl);
+                            allLinks.add(batchUrl);
+                            return;
                         }
-                        return null;
-                    } catch {
-                        return null;
+
+                        const html = await this.fetchWithCORS(batchUrl);
+                        processedUrls.add(batchUrl);
+                        allLinks.add(batchUrl);
+
+                        // Enhanced URL discovery to include file links
+                        const urlMatches = html.match(/(?:href|src)=["'](.*?)["']/g) || [];
+                        const newUrls = urlMatches
+                            .map(match => {
+                                try {
+                                    const href = match.match(/(?:href|src)=["'](.*?)["']/)[1];
+                                    const fullUrl = new URL(href, batchUrl).href;
+                                    if (fullUrl.startsWith(baseUrl)) {
+                                        const hrefPath = new URL(fullUrl).pathname;
+                                        if (this.isWithinBasePath(hrefPath, basePath)) {
+                                            return fullUrl;
+                                        }
+                                    }
+                                    return null;
+                                } catch {
+                                    return null;
+                                }
+                            })
+                            .filter(url => url && 
+                                !processedUrls.has(url) && 
+                                !Array.from(pendingUrls).includes(url)
+                            );
+
+                        // Add new URLs to pending set
+                        newUrls.forEach(url => pendingUrls.add(url));
+                        
+                        const totalUrls = processedUrls.size + pendingUrls.size;
+                        const progress = (processedUrls.size / totalUrls) * 70;
+                        this.updateProgress(progress, `Discovered ${allLinks.size} links...`);
+                        this.log(`Found ${newUrls.length} new links on ${batchUrl}`, 'info');
+                    } catch (error) {
+                        this.log(`Error processing ${batchUrl}: ${error.message}`, 'warning');
                     }
-                })
-                .filter(href => href && !allLinks.has(href));
+                });
 
-            // Remove duplicates
-            const uniqueLinks = [...new Set(links)];
-
-            for (const link of uniqueLinks) {
-                await this.collectUrls(link, allLinks, baseUrl, basePath, depth + 1, maxDepth);
+                // Process batch with concurrency limit
+                for (let i = 0; i < newBatch.length; i += this.maxConcurrentRequests) {
+                    const batchPromises = promises.slice(i, i + this.maxConcurrentRequests);
+                    await Promise.all(batchPromises);
+                }
             }
         } catch (error) {
-            this.log(`Error scanning ${url}: ${error.message}`, 'warning');
+            this.log(`Error discovering links: ${error.message}`, 'warning');
         }
     }
 
@@ -319,32 +367,31 @@ class WebScraper {
     generateUniqueFilename(url) {
         try {
             const urlObj = new URL(url);
-            // Get the path without leading/trailing slashes and split into parts
             const pathParts = urlObj.pathname.replace(/^\/|\/$/g, '').split('/');
             
             if (pathParts.length === 0 || (pathParts.length === 1 && pathParts[0] === '')) {
                 return 'index.html';
             }
 
-            // Create filename from path
-            let filename = pathParts.join('_');
+            // Get the original filename
+            let filename = pathParts[pathParts.length - 1];
             
-            // If the filename doesn't end with .html, add it
-            if (!filename.endsWith('.html')) {
-                filename += '.html';
+            // If filename is empty or doesn't have an extension
+            if (!filename || !filename.includes('.')) {
+                filename = pathParts.join('_') + '.html';
             }
 
-            // Replace any remaining special characters
-            filename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-            
-            return filename;
+            // Replace any remaining special characters while preserving the extension
+            const [name, ext] = filename.split('.');
+            const sanitizedName = name.replace(/[^a-zA-Z0-9._-]/g, '_');
+            return `${sanitizedName}.${ext}`;
         } catch (error) {
             console.error('Error generating filename:', error);
             return `page_${Math.random().toString(36).substr(2, 9)}.html`;
         }
     }
 
-    // Update the downloadSelected method
+    // Update the downloadSelected method to use concurrent downloads
     async downloadSelected() {
         const zip = new JSZip();
         const selected = this.getSelectedUrls();
@@ -356,60 +403,63 @@ class WebScraper {
         }
 
         try {
-            this.log(`Starting scan and download of ${selected.length} pages...`, 'info');
+            this.log(`Starting download of ${selected.length} pages...`, 'info');
             this.progressSection.style.display = 'block';
-            this.updateProgress(0, 'Starting process...');
+            this.updateProgress(0, 'Starting download...');
 
-            // Create a map to track filename occurrences
             const filenameCount = new Map();
+            let completedDownloads = 0;
 
-            // First scan all selected pages
-            for (let i = 0; i < selected.length; i++) {
-                const url = selected[i];
-                const progress = Math.round((i / selected.length) * 50);
-                this.updateProgress(progress, `Scanning ${i + 1} of ${selected.length} pages...`);
-                
-                this.log(`Scanning: ${url}`, 'info');
-                try {
-                    const content = await this.fetchWithCORS(url);
-                    let filename = this.generateUniqueFilename(url);
-                    
-                    // Handle duplicate filenames
-                    if (filenameCount.has(filename)) {
-                        const count = filenameCount.get(filename) + 1;
-                        filenameCount.set(filename, count);
-                        const nameParts = filename.split('.');
-                        filename = `${nameParts[0]}_${count}.${nameParts[1]}`;
-                    } else {
-                        filenameCount.set(filename, 1);
+            // Process downloads in batches
+            for (let i = 0; i < selected.length; i += this.batchSize) {
+                const batch = selected.slice(i, i + this.batchSize);
+                const downloadPromises = batch.map(async (url) => {
+                    try {
+                        const isBinary = this.isBinaryFile(url);
+                        let content;
+                        
+                        if (isBinary) {
+                            // Fetch binary content
+                            const response = await fetch(url);
+                            if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                            content = await response.blob();
+                        } else {
+                            // Fetch HTML content
+                            content = await this.fetchWithCORS(url);
+                        }
+
+                        // Generate filename based on URL and content type
+                        let filename = this.generateUniqueFilename(url);
+                        
+                        if (filenameCount.has(filename)) {
+                            const count = filenameCount.get(filename) + 1;
+                            filenameCount.set(filename, count);
+                            const nameParts = filename.split('.');
+                            filename = `${nameParts[0]}_${count}.${nameParts[1]}`;
+                        } else {
+                            filenameCount.set(filename, 1);
+                        }
+                        
+                        zip.file(filename, content);
+                        completedDownloads++;
+                        
+                        const progress = Math.round((completedDownloads / selected.length) * 90);
+                        this.updateProgress(progress, `Downloaded ${completedDownloads} of ${selected.length} files...`);
+                        this.log(`Downloaded: ${url} → ${filename}`, 'success');
+                    } catch (error) {
+                        this.log(`Failed to download ${url}: ${error.message}`, 'error');
                     }
-                    
-                    this.scannedPages.set(url, {
-                        content: content,
-                        filename: filename
-                    });
-                    this.log(`Scanned: ${url} → ${filename}`, 'success');
-                } catch (error) {
-                    this.log(`Failed to scan ${url}: ${error.message}`, 'error');
-                    continue;
+                });
+
+                // Process batch with concurrency limit
+                for (let j = 0; j < batch.length; j += this.maxConcurrentRequests) {
+                    const batchPromises = downloadPromises.slice(j, j + this.maxConcurrentRequests);
+                    await Promise.all(batchPromises);
                 }
             }
 
-            // Then create ZIP with scanned content
-            this.log('Creating ZIP file with scanned pages...', 'info');
-            for (let i = 0; i < selected.length; i++) {
-                const url = selected[i];
-                const progress = 50 + Math.round((i / selected.length) * 40);
-                this.updateProgress(progress, `Adding ${i + 1} of ${selected.length} pages to ZIP...`);
-                
-                const pageData = this.scannedPages.get(url);
-                if (pageData) {
-                    zip.file(pageData.filename, pageData.content);
-                    this.log(`Added to ZIP: ${pageData.filename}`, 'success');
-                }
-            }
-            
-            this.updateProgress(90, 'Finalizing ZIP file...');
+            // Create and download ZIP file
+            this.updateProgress(95, 'Creating ZIP file...');
             const content = await zip.generateAsync({type: 'blob'});
             
             this.updateProgress(100, 'Download ready!');
@@ -426,16 +476,13 @@ class WebScraper {
             
             this.log('Download started!', 'success');
 
-            // Clear the scanned pages cache
-            this.scannedPages.clear();
-
             setTimeout(() => {
                 this.progressSection.style.display = 'none';
             }, 1000);
         } catch (error) {
-            console.error('Error processing pages:', error);
-            this.log(`Error processing pages: ${error.message}`, 'error');
-            alert('Error processing pages. Please try again.');
+            console.error('Error downloading pages:', error);
+            this.log(`Error downloading pages: ${error.message}`, 'error');
+            alert('Error downloading pages. Please try again.');
             this.progressSection.style.display = 'none';
         }
     }
@@ -476,6 +523,16 @@ class WebScraper {
         }
         
         return true;
+    }
+
+    // Add method to check if URL is a binary file
+    isBinaryFile(url) {
+        try {
+            const extension = url.toLowerCase().split('.').pop();
+            return this.binaryExtensions.has(`.${extension}`);
+        } catch {
+            return false;
+        }
     }
 }
 
